@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""
+2FA-wait — poll bloqueante hasta que el poller confirme la validacion.
+
+Uso:
+  2fa-wait <nonce> [timeout_segundos]
+
+Espera a que executed.log contenga "nonce=<nonce>". Sale 0 si confirmado
+antes del timeout (default 310s, cubre el TTL de 5 min del challenge).
+Sale 1 si expira sin confirmacion.
+
+El agente invoca esto con poll()/wait() tras lanzar el challenge, y al
+recibir exit 0 revela la respuesta de forma AUTONOMA (sin que el usuario
+pregunte de nuevo).
+"""
+import os
+import sys
+import time
+from pathlib import Path
+
+BASE = Path(os.environ.get("HERMES_2FA_DIR", "/home/michael/.hermes/2fa"))
+LOG = BASE / "executed.log"
+POLL = 2
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Uso: 2fa-wait <nonce> [timeout]")
+        sys.exit(1)
+    nonce = sys.argv[1]
+    timeout = int(sys.argv[2]) if len(sys.argv) > 2 else 310
+    target = f"nonce={nonce}"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if LOG.exists():
+            try:
+                for line in LOG.read_text().splitlines():
+                    if target in line and "ACCION AUTORIZADA" in line:
+                        print("CONFIRMED")
+                        # Cleanup automático: mata poller + webform huerfanos
+                        # Esto elimina la responsabilidad del agente de correr
+                        # 2fa-stop-childs stop manualmente tras CONFIRMED.
+                        stop_childs = BASE / "2fa-stop-childs"
+                        if stop_childs.exists():
+                            import subprocess
+                            subprocess.run(
+                                [sys.executable, str(stop_childs), "stop"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                        sys.exit(0)
+            except Exception:
+                pass
+        time.sleep(POLL)
+    print("TIMEOUT")
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""
+2FA-validator — componente de verificacion fuera del chat.
+
+Flujo:
+  1. Recibe un challenge_id (hex) por argumento O por input interactivo.
+  2. Lee el hash verifier desde la variable de entorno 2FA_SECRET.
+  3. Pide la palabra clave por getpass (sin eco, fuera del chat).
+  4. Valida con argon2 (verify) + chequea que el challenge exista y no haya expirado.
+  5. Si TODO cuadra: escribe un token file (mode 600) y sale 0.
+  6. Si NO: NO escribe token, registra intento fallido (lockout), sale 1.
+
+Uso:
+  2fa-validator <challenge_id>     # challenge por argumento
+  2fa-validator                   # pide el challenge_id por input
+
+El agente NUNCA ve la palabra clave ni el hash. Solo lee el token file.
+"""
+import os
+import sys
+import time
+import json
+import secrets
+import getpass
+from pathlib import Path
+
+
+def secure_input(prompt):
+    """Lee la palabra clave SIEMPRE como password: interactivo y enmascarado
+    (sin eco ni asteriscos) mediante getpass de la stdlib. No requiere ningun
+    argumento para activar la proteccion: getpass oculta el input por diseno
+    en cualquier sesion interactiva (ssh -t, shell local). Funciona sin
+    modificar el flujo previo del validador."""
+    return getpass.getpass(prompt)
+
+BASE = Path(os.environ.get("HERMES_2FA_DIR", "/home/michael/.hermes/2fa"))
+PENDING_DIR = BASE / "pending"
+TOKEN_DIR = BASE / "tokens"
+LOCKOUT_FILE = BASE / "lockout.json"
+TTL = 300  # 5 minutos
+MAX_FAILS = 3
+LOCKOUT_SECONDS = 600  # 10 minutos
+
+
+def load_env_var(name):
+    """Lee la var del entorno; si no esta, la carga desde el .env de Hermes.
+    Esto permite que el validador funcione en sesiones SSH donde el .env
+    no se sourced automaticamente."""
+    val = os.environ.get(name)
+    if val:
+        return val
+    env_path = BASE.parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            if k.strip() == name:
+                return v.strip()
+    return None
+
+# Usar el venv local para importar argon2-cffi
+VENV = BASE / ".venv"
+if VENV.exists():
+    sys.path.insert(0, str(VENV / "lib" / "python3.12" / "site-packages"))
+
+
+def fail(msg):
+    # Mensaje generico: no dar oracle (clave incorrecta vs hash corrupto).
+    print("Hubo un error con el proceso de 2FA")
+    sys.exit(1)
+
+
+def load_lockout():
+    if LOCKOUT_FILE.exists():
+        try:
+            return json.loads(LOCKOUT_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_lockout(data):
+    LOCKOUT_FILE.write_text(json.dumps(data))
+
+
+def check_lockout():
+    data = load_lockout()
+    if data.get("until", 0) > time.time():
+        print("Hubo un error con el proceso de 2FA")
+        sys.exit(1)
+
+
+def register_fail():
+    data = load_lockout()
+    fails = data.get("fails", 0) + 1
+    if fails >= MAX_FAILS:
+        data["until"] = time.time() + LOCKOUT_SECONDS
+        data["fails"] = 0
+        save_lockout(data)
+        # Lockout fuerte: detener el gateway (owner lo revive por portal).
+        os.system("hermes gateway stop >/dev/null 2>&1 || true")
+        print("Hubo un error con el proceso de 2FA")
+        sys.exit(1)
+    data["fails"] = fails
+    save_lockout(data)
+
+
+def main():
+    check_lockout()
+
+    if len(sys.argv) >= 2:
+        challenge = sys.argv[1].strip()
+    else:
+        # Sin argumento: pedir el challenge_id por input (flujo interactivo).
+        try:
+            challenge = input("Challenge ID: ").strip()
+        except EOFError:
+            challenge = ""
+    if not challenge:
+        print("Hubo un error con el proceso de 2FA")
+        sys.exit(1)
+
+    pending_file = PENDING_DIR / f"{challenge}.json"
+    if not pending_file.exists():
+        fail("challenge inexistente")
+
+    try:
+        pending = json.loads(pending_file.read_text())
+    except Exception:
+        fail("challenge corrupto")
+
+    if time.time() > pending.get("expires", 0):
+        pending_file.unlink(missing_ok=True)
+        fail("challenge expirado")
+
+    verifier = load_env_var("2FA_SECRET")
+    if not verifier:
+        fail("verifier no configurado")
+
+    key = secure_input("Palabra clave 2FA: ")
+
+    try:
+        from argon2 import PasswordHasher
+        from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
+        ph = PasswordHasher()
+        ph.verify(verifier, key)
+    except (VerifyMismatchError, VerificationError, InvalidHashError):
+        register_fail()
+        fail("verificacion fallida")
+    except Exception:
+        fail("error interno")
+
+    # Exito: escribir token file (mode 600) ligado al challenge.
+    # NO borrar el pending aqui: el poller lo usa para saber la accion y
+    # luego limpia token + pending. Evita race condition.
+    TOKEN_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    token_file = TOKEN_DIR / f"{challenge}.token"
+    token_file.write_text(secrets.token_hex(16))
+    os.chmod(token_file, 0o600)
+    # Reset de fails tras exito.
+    data = load_lockout()
+    data["fails"] = 0
+    save_lockout(data)
+    print("OK")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

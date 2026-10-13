@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""
+2fa-stop-childs — lifecycle manager for the 2FA background children.
+
+The agent drives the main flow (2fa-challenger -> deliver challenge -> 2fa-wait
+-> on CONFIRMED, stop children). This script owns ONLY the child processes:
+
+  * 2fa-poller  (ephemeral; waits for the token, then executes the action)
+  * 2fa-wait    (agent-side sensor; the agent launches its own with
+                notify_on_complete, so it is NOT spawned here)
+  * webform_server.py (optional browser frontend for the 2FA key entry)
+
+Usage:
+  2fa-stop-childs stop                 -> kill poller + webform (idempotent)
+  2fa-stop-childs start <challenge>    -> launch poller --once + webform server
+
+Design notes:
+  * Children are spawned via subprocess.Popen (not a shell wrapper). This keeps
+    the challenge OUT of any `bash -c` cmdline, so the poller's own
+    anti-duplicate guard (which does `pgrep -af 2fa-poller`) never
+    false-positives on a wrapping shell that carries the challenge string.
+  * Killing uses the bracket trick (`[2]fa-*`, `[w]ebform_server.py`) so the
+    command never matches itself. The script also excludes its own PID.
+  * The webform server reads its port from the user-managed _2FA_WEB_PORT env
+    var (set in ~/.hermes/.env); it is never printed or logged.
+"""
+import os
+import sys
+import time
+import signal
+import subprocess
+from pathlib import Path
+
+BASE = Path(os.environ.get("HERMES_2FA_DIR", "/home/michael/.hermes/2fa"))
+POLLER = BASE / "2fa-poller"
+WEBFORM = BASE / "webform_server.py"
+
+
+def _pids_matching(pattern: str):
+    """Return PIDs whose cmdline matches `pattern`, excluding our own PID."""
+    me = os.getpid()
+    try:
+        out = subprocess.run(
+            ["pgrep", "-af", pattern], capture_output=True, text=True
+        ).stdout
+    except Exception:
+        return []
+    pids = []
+    for line in out.splitlines():
+        parts = line.split(None, 1)
+        if not parts:
+            continue
+        try:
+            pid = int(parts[0])
+        except ValueError:
+            continue
+        if pid == me:
+            continue
+        pids.append(pid)
+    return pids
+
+
+def stop_childs():
+    """Kill any live poller and webform server. Idempotent."""
+    killed = []
+    # Bracket trick: "[2]fa-poller" / "[w]ebform_server.py" never match the
+    # literal pgrep command itself.
+    # NOTE: 2fa-wait is owned by the AGENT (its sensor for CONFIRMED via
+    # notify_on_complete) and self-terminates on CONFIRMED/TIMEOUT; it is
+    # intentionally NOT managed here to keep the 2FA-pure mechanism separate
+    # from agent-side orchestration.
+    for pat in ("[2]fa-poller", "[w]ebform_server.py"):
+        for pid in _pids_matching(pat):
+            try:
+                os.kill(pid, signal.SIGTERM)
+                killed.append(pid)
+            except ProcessLookupError:
+                pass
+    if killed:
+        time.sleep(0.4)
+        # Force any that survived (wait excluded, agent-owned).
+        for pat in ("[2]fa-poller", "[w]ebform_server.py"):
+            for pid in _pids_matching(pat):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+    return killed
+
+
+def start_childs(challenge: str):
+    """Launch poller --once and the webform server. Returns (poller_pid, web_pid)."""
+    env = dict(os.environ)
+    poller = subprocess.Popen(
+        [sys.executable, str(POLLER), "--once", challenge],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+    web = subprocess.Popen(
+        [sys.executable, str(WEBFORM)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    )
+    return poller.pid, web.pid
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Uso: 2fa-stop-childs <stop|start> [challenge]")
+        sys.exit(1)
+
+    action = sys.argv[1]
+    if action == "stop":
+        killed = stop_childs()
+        print(f"[2FA-stop-childs] procesos detenidos: {killed if killed else 'ninguno'}")
+        sys.exit(0)
+    elif action == "start":
+        if len(sys.argv) < 3:
+            print("Uso: 2fa-stop-childs start <challenge>")
+            sys.exit(1)
+        challenge = sys.argv[2].strip()
+        # Always stop first to guarantee a clean slate.
+        stop_childs()
+        time.sleep(0.3)
+        poller_pid, web_pid = start_childs(challenge)
+        print(f"[2FA-stop-childs] poller pid={poller_pid} webform pid={web_pid}")
+        sys.exit(0)
+    else:
+        print(f"accion desconocida: {action}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

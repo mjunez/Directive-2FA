@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""
+2FA-poller (modo efimero) — espera la validacion de UN solo challenge.
+
+Uso:
+  2fa-poller --once <challenge_id>
+
+Comportamiento:
+  - Bucle con POLL_INTERVAL hasta que ocurra lo primero:
+      a) aparece tokens/<challenge>.token  -> ejecuta accion, limpia, sale 0
+      b) expira el TTL del challenge        -> descarta, limpia, sale 0
+  - El proceso muere solo (no es daemon permanente).
+  - El agente lo lanza justo tras 2fa-challenger, en background.
+
+El agente NO actua por claim de chat; solo este poller, al ver el token
+(escrito por 2fa-validator con mode 600), dispara la accion.
+"""
+import os
+import sys
+import time
+import json
+import signal
+import subprocess
+from pathlib import Path
+
+BASE = Path(os.environ.get("HERMES_2FA_DIR", "/home/michael/.hermes/2fa"))
+PENDING_DIR = BASE / "pending"
+TOKEN_DIR = BASE / "tokens"
+POLL_INTERVAL = 2
+
+
+def other_poller_watching(challenge: str) -> bool:
+    """True si YA hay otro proceso 2fa-poller vigilando este mismo challenge.
+    Evita duplicar la accion si el agente lanza dos poller por error."""
+    try:
+        out = subprocess.run(
+            ["pgrep", "-af", "2fa-poller"], capture_output=True, text=True,
+        ).stdout
+    except Exception:
+        return False
+    me = os.getpid()
+    for line in out.splitlines():
+        if "hermes-snap" in line:
+            continue
+        if challenge not in line:
+            continue
+        parts = line.split(None, 1)
+        if parts and int(parts[0]) != me:
+            return True
+    return False
+
+
+def execute_action(action: str, nonce: str):
+    log = BASE / "executed.log"
+    with log.open("a") as f:
+        f.write(f"{time.time()}: ACCION AUTORIZADA 2FA -> {action} | nonce={nonce}\n")
+    print(f"[2FA] accion ejecutada: {action}")
+
+
+def main():
+    if len(sys.argv) < 3 or sys.argv[1] != "--once":
+        print("Uso: 2fa-poller --once <challenge_id>")
+        sys.exit(1)
+
+    challenge = sys.argv[2].strip()
+    pending_file = PENDING_DIR / f"{challenge}.json"
+    token_file = TOKEN_DIR / f"{challenge}.token"
+
+    if not pending_file.exists():
+        print("Hubo un error con el proceso de 2FA")
+        sys.exit(1)
+
+    # Guard contra poller duplicado del mismo challenge (el agente puede
+    # haber lanzado dos por error). Si ya hay otro vigilando, este sale.
+    if other_poller_watching(challenge):
+        print("[2FA] otro poller ya vigila este challenge; salgo")
+        sys.exit(0)
+
+    try:
+        pending = json.loads(pending_file.read_text())
+    except Exception:
+        pending_file.unlink(missing_ok=True)
+        print("Hubo un error con el proceso de 2FA")
+        sys.exit(1)
+
+    while True:
+        now = time.time()
+        if token_file.exists():
+            execute_action(pending.get("action", "desconocida"), pending.get("nonce", ""))
+            token_file.unlink(missing_ok=True)
+            pending_file.unlink(missing_ok=True)
+            sys.exit(0)
+        if now > pending.get("expires", 0):
+            pending_file.unlink(missing_ok=True)
+            sys.exit(0)
+        time.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
